@@ -31,6 +31,8 @@ import pkgutil
 import time
 import threading
 
+import trio
+
 from .util import print_error
 from .i18n import _
 from .util import profiler, PrintError, DaemonThread, UserCancelled, ThreadJob
@@ -44,8 +46,8 @@ hooks = {}
 class Plugins(DaemonThread):
 
     @profiler
-    def __init__(self, config, is_local, gui_name):
-        DaemonThread.__init__(self)
+    def __init__(self, config, is_local, gui_name, nursery):
+        DaemonThread.__init__(self, nursery)
         if is_local:
             find = imp.find_module('plugins')
             plugins = imp.load_module('electrum_plugins', *find)
@@ -179,10 +181,10 @@ class Plugins(DaemonThread):
             self.load_plugin(name)
         return self.plugins[name]
 
-    def run(self):
+    async def run(self):
         while self.is_running():
-            time.sleep(0.1)
-            self.run_jobs()
+            await trio.sleep(0.1)
+            await self.run_jobs()
         self.on_stop()
 
 
@@ -323,7 +325,7 @@ class DeviceMgr(ThreadJob, PrintError):
         # Thread job to handle device timeouts
         return [self]
 
-    def run(self):
+    async def run(self):
         '''Handle device timeouts.  Runs in the context of the Plugins
         thread.'''
         with self.lock:

@@ -195,7 +195,7 @@ class Synchronizer(ThreadJob):
         self.subscribe_to_addresses(set(self.wallet.get_addresses()))
         self.initialized = True
 
-    def run(self):
+    async def run(self):
         '''Called from the network proxy thread main loop.'''
         # 1. Create new addresses
         self.wallet.synchronize()

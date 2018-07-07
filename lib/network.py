@@ -28,11 +28,12 @@ import random
 import re
 import select
 from collections import defaultdict
-import threading
 import socket
 import json
 import sys
 import ipaddress
+
+import trio
 
 import dns
 import dns.resolver
@@ -167,10 +168,10 @@ class Network(util.DaemonThread):
           is_connected(), set_parameters(), stop()
     """
 
-    def __init__(self, config=None):
+    def __init__(self, nursery, config=None):
         if config is None:
             config = {}  # Do not use mutables as default values!
-        util.DaemonThread.__init__(self)
+        util.DaemonThread.__init__(self, nursery)
         self.config = SimpleConfig(config) if isinstance(config, dict) else config
         self.num_server = 10 if not self.config.get('oneserver') else 0
         self.blockchains = blockchain.read_blockchains(self.config)  # note: needs self.blockchains_lock
@@ -189,14 +190,6 @@ class Network(util.DaemonThread):
                 self.default_server = None
         if not self.default_server:
             self.default_server = pick_random_server()
-
-        # locks: if you need to take multiple ones, acquire them in the order they are defined here!
-        self.interface_lock = threading.RLock()            # <- re-entrant
-        self.callback_lock = threading.Lock()
-        self.pending_sends_lock = threading.Lock()
-        self.recent_servers_lock = threading.RLock()       # <- re-entrant
-        self.subscribed_addresses_lock = threading.Lock()
-        self.blockchains_lock = threading.Lock()
 
         self.pending_sends = []
         self.message_id = 0
@@ -236,32 +229,17 @@ class Network(util.DaemonThread):
         self.start_network(deserialize_server(self.default_server)[2],
                            deserialize_proxy(self.config.get('proxy')))
 
-    def with_interface_lock(func):
-        def func_wrapper(self, *args, **kwargs):
-            with self.interface_lock:
-                return func(self, *args, **kwargs)
-        return func_wrapper
-
-    def with_recent_servers_lock(func):
-        def func_wrapper(self, *args, **kwargs):
-            with self.recent_servers_lock:
-                return func(self, *args, **kwargs)
-        return func_wrapper
-
     def register_callback(self, callback, events):
-        with self.callback_lock:
-            for event in events:
-                self.callbacks[event].append(callback)
+        for event in events:
+            self.callbacks[event].append(callback)
 
     def unregister_callback(self, callback):
-        with self.callback_lock:
-            for callbacks in self.callbacks.values():
-                if callback in callbacks:
-                    callbacks.remove(callback)
+        for callbacks in self.callbacks.values():
+            if callback in callbacks:
+                callbacks.remove(callback)
 
     def trigger_callback(self, event, *args):
-        with self.callback_lock:
-            callbacks = self.callbacks[event][:]
+        callbacks = self.callbacks[event][:]
         [callback(event, *args) for callback in callbacks]
 
     def read_recent_servers(self):
@@ -275,7 +253,6 @@ class Network(util.DaemonThread):
         except:
             return []
 
-    @with_recent_servers_lock
     def save_recent_servers(self):
         if not self.config.path:
             return
@@ -287,7 +264,6 @@ class Network(util.DaemonThread):
         except:
             pass
 
-    @with_interface_lock
     def get_server_height(self):
         return self.interface.tip if self.interface else 0
 
@@ -315,7 +291,6 @@ class Network(util.DaemonThread):
     def is_up_to_date(self):
         return self.unanswered_requests == {}
 
-    @with_interface_lock
     def queue_request(self, method, params, interface=None):
         # If you want to queue a request on any interface it must go
         # through this function so message ids are properly tracked
@@ -331,7 +306,6 @@ class Network(util.DaemonThread):
         interface.queue_request(method, params, message_id)
         return message_id
 
-    @with_interface_lock
     def send_subscriptions(self):
         assert self.interface
         self.print_error('sending subscriptions to', self.interface.server, len(self.unanswered_requests), len(self.subscribed_addresses))
@@ -347,9 +321,8 @@ class Network(util.DaemonThread):
         self.queue_request('server.peers.subscribe', [])
         self.request_fee_estimates()
         self.queue_request('blockchain.relayfee', [])
-        with self.subscribed_addresses_lock:
-            for h in self.subscribed_addresses:
-                self.queue_request('blockchain.scripthash.subscribe', [h])
+        for h in self.subscribed_addresses:
+            self.queue_request('blockchain.scripthash.subscribe', [h])
 
     def request_fee_estimates(self):
         from .simple_config import FEE_ETA_TARGETS
@@ -389,12 +362,10 @@ class Network(util.DaemonThread):
         if self.is_connected():
             return self.donation_address
 
-    @with_interface_lock
     def get_interfaces(self):
         '''The interfaces that are in connected state'''
         return list(self.interfaces.keys())
 
-    @with_recent_servers_lock
     def get_servers(self):
         out = constants.net.DEFAULT_SERVERS
         if self.irc_servers:
@@ -409,7 +380,6 @@ class Network(util.DaemonThread):
                     out[host] = { protocol:port }
         return out
 
-    @with_interface_lock
     def start_interface(self, server):
         if (not server in self.interfaces and not server in self.connecting):
             if server == self.default_server:
@@ -419,8 +389,7 @@ class Network(util.DaemonThread):
             c = Connection(server, self.socket_queue, self.config.path)
 
     def start_random_interface(self):
-        with self.interface_lock:
-            exclude_set = self.disconnected_servers.union(set(self.interfaces))
+        exclude_set = self.disconnected_servers.union(set(self.interfaces))
         server = pick_random_server(self.get_servers(), self.protocol, exclude_set)
         if server:
             self.start_interface(server)
@@ -486,7 +455,6 @@ class Network(util.DaemonThread):
             addr = host
         return socket._getaddrinfo(addr, *args, **kwargs)
 
-    @with_interface_lock
     def start_network(self, protocol, proxy):
         assert not self.interface and not self.interfaces
         assert not self.connecting and self.socket_queue.empty()
@@ -496,7 +464,6 @@ class Network(util.DaemonThread):
         self.set_proxy(proxy)
         self.start_interfaces()
 
-    @with_interface_lock
     def stop_network(self):
         self.print_error("stopping network")
         for interface in list(self.interfaces.values()):
@@ -546,7 +513,6 @@ class Network(util.DaemonThread):
         if servers:
             self.switch_to_interface(random.choice(servers))
 
-    @with_interface_lock
     def switch_lagging_interface(self):
         '''If auto_connect and lagging, switch interface'''
         if self.server_is_lagging() and self.auto_connect:
@@ -557,7 +523,6 @@ class Network(util.DaemonThread):
                 choice = random.choice(filtered)
                 self.switch_to_interface(choice)
 
-    @with_interface_lock
     def switch_to_interface(self, server):
         '''Switch to server as our interface.  If no connection exists nor
         being opened, start a thread to connect.  The actual switch will
@@ -580,7 +545,6 @@ class Network(util.DaemonThread):
             self.notify('updated')
             self.notify('interfaces')
 
-    @with_interface_lock
     def close_interface(self, interface):
         if interface:
             if interface.server in self.interfaces:
@@ -589,7 +553,6 @@ class Network(util.DaemonThread):
                 self.interface = None
             interface.close()
 
-    @with_recent_servers_lock
     def add_recent_server(self, server):
         # list is ordered
         if server in self.recent_servers:
@@ -683,8 +646,7 @@ class Network(util.DaemonThread):
                 # Only once we've received a response to an addr subscription
                 # add it to the list; avoids double-sends on reconnection
                 if method == 'blockchain.scripthash.subscribe':
-                    with self.subscribed_addresses_lock:
-                        self.subscribed_addresses.add(params[0])
+                    self.subscribed_addresses.add(params[0])
             else:
                 if not response:  # Closed remotely / misbehaving
                     self.connection_down(interface.server)
@@ -703,27 +665,23 @@ class Network(util.DaemonThread):
 
             # update cache if it's a subscription
             if method.endswith('.subscribe'):
-                with self.interface_lock:
-                    self.sub_cache[k] = response
+                self.sub_cache[k] = response
             # Response is now in canonical form
             self.process_response(interface, response, callbacks)
 
     def send(self, messages, callback):
         '''Messages is a list of (method, params) tuples'''
         messages = list(messages)
-        with self.pending_sends_lock:
-            self.pending_sends.append((messages, callback))
+        self.pending_sends.append((messages, callback))
 
-    @with_interface_lock
     def process_pending_sends(self):
         # Requests needs connectivity.  If we don't have an interface,
         # we cannot process them.
         if not self.interface:
             return
 
-        with self.pending_sends_lock:
-            sends = self.pending_sends
-            self.pending_sends = []
+        sends = self.pending_sends
+        self.pending_sends = []
 
         for messages, callback in sends:
             for method, params in messages:
@@ -734,8 +692,7 @@ class Network(util.DaemonThread):
                     l = list(self.subscriptions.get(k, []))
                     if callback not in l:
                         l.append(callback)
-                    with self.callback_lock:
-                        self.subscriptions[k] = l
+                    self.subscriptions[k] = l
                     # check cached response for subscriptions
                     r = self.sub_cache.get(k)
 
@@ -751,12 +708,10 @@ class Network(util.DaemonThread):
         # Note: we can't unsubscribe from the server, so if we receive
         # subsequent notifications process_response() will emit a harmless
         # "received unexpected notification" warning
-        with self.callback_lock:
-            for v in self.subscriptions.values():
-                if callback in v:
-                    v.remove(callback)
+        for v in self.subscriptions.values():
+            if callback in v:
+                v.remove(callback)
 
-    @with_interface_lock
     def connection_down(self, server):
         '''A connection to server either went down, or was never made.
         We distinguish by whether it is in self.interfaces.'''
@@ -766,10 +721,9 @@ class Network(util.DaemonThread):
         if server in self.interfaces:
             self.close_interface(self.interfaces[server])
             self.notify('interfaces')
-        with self.blockchains_lock:
-            for b in self.blockchains.values():
-                if b.catch_up == server:
-                    b.catch_up = None
+        for b in self.blockchains.values():
+            if b.catch_up == server:
+                b.catch_up = None
 
     def new_interface(self, server, socket):
         # todo: get tip first, then decide which checkpoint to use.
@@ -780,8 +734,7 @@ class Network(util.DaemonThread):
         interface.tip = 0
         interface.mode = 'default'
         interface.request = None
-        with self.interface_lock:
-            self.interfaces[server] = interface
+        self.interfaces[server] = interface
         # server.version should be the first message
         params = [ELECTRUM_VERSION, PROTOCOL_VERSION]
         self.queue_request('server.version', params, interface)
@@ -804,8 +757,7 @@ class Network(util.DaemonThread):
 
         # Send pings and shut down stale interfaces
         # must use copy of values
-        with self.interface_lock:
-            interfaces = list(self.interfaces.values())
+        interfaces = list(self.interfaces.values())
         for interface in interfaces:
             if interface.has_timed_out():
                 self.connection_down(interface.server)
@@ -814,30 +766,28 @@ class Network(util.DaemonThread):
 
         now = time.time()
         # nodes
-        with self.interface_lock:
-            if len(self.interfaces) + len(self.connecting) < self.num_server:
-                self.start_random_interface()
-                if now - self.nodes_retry_time > NODES_RETRY_INTERVAL:
-                    self.print_error('network: retrying connections')
-                    self.disconnected_servers = set([])
-                    self.nodes_retry_time = now
+        if len(self.interfaces) + len(self.connecting) < self.num_server:
+            self.start_random_interface()
+            if now - self.nodes_retry_time > NODES_RETRY_INTERVAL:
+                self.print_error('network: retrying connections')
+                self.disconnected_servers = set([])
+                self.nodes_retry_time = now
 
         # main interface
-        with self.interface_lock:
-            if not self.is_connected():
-                if self.auto_connect:
-                    if not self.is_connecting():
-                        self.switch_to_random_interface()
-                else:
-                    if self.default_server in self.disconnected_servers:
-                        if now - self.server_retry_time > SERVER_RETRY_INTERVAL:
-                            self.disconnected_servers.remove(self.default_server)
-                            self.server_retry_time = now
-                    else:
-                        self.switch_to_interface(self.default_server)
+        if not self.is_connected():
+            if self.auto_connect:
+                if not self.is_connecting():
+                    self.switch_to_random_interface()
             else:
-                if self.config.is_fee_estimates_update_required():
-                    self.request_fee_estimates()
+                if self.default_server in self.disconnected_servers:
+                    if now - self.server_retry_time > SERVER_RETRY_INTERVAL:
+                        self.disconnected_servers.remove(self.default_server)
+                        self.server_retry_time = now
+                else:
+                    self.switch_to_interface(self.default_server)
+        else:
+            if self.config.is_fee_estimates_update_required():
+                self.request_fee_estimates()
 
     def request_chunk(self, interface, index):
         if index in self.requested_chunks:
@@ -958,8 +908,7 @@ class Network(util.DaemonThread):
                     if bh > interface.good:
                         if not interface.blockchain.check_header(interface.bad_header):
                             b = interface.blockchain.fork(interface.bad_header)
-                            with self.blockchains_lock:
-                                self.blockchains[interface.bad] = b
+                            self.blockchains[interface.bad] = b
                             interface.blockchain = b
                             interface.print_error("new chain", b.checkpoint)
                             interface.mode = 'catch_up'
@@ -1011,8 +960,7 @@ class Network(util.DaemonThread):
         self.notify('interfaces')
 
     def maintain_requests(self):
-        with self.interface_lock:
-            interfaces = list(self.interfaces.values())
+        interfaces = list(self.interfaces.values())
         for interface in interfaces:
             if interface.request and time.time() - interface.request_time > 20:
                 interface.print_error("blockchain request timed out")
@@ -1025,8 +973,7 @@ class Network(util.DaemonThread):
         if not self.interfaces:
             time.sleep(0.1)
             return
-        with self.interface_lock:
-            interfaces = list(self.interfaces.values())
+        interfaces = list(self.interfaces.values())
         rin = [i for i in interfaces]
         win = [i for i in interfaces if i.num_requests()]
         try:
@@ -1053,13 +1000,14 @@ class Network(util.DaemonThread):
         with b.lock:
             b.update_size()
 
-    def run(self):
+    async def run(self):
         self.init_headers_file()
         while self.is_running():
+            await trio.sleep(0.1)
             self.maintain_sockets()
             self.wait_on_sockets()
             self.maintain_requests()
-            self.run_jobs()    # Synchronizer and Verifier
+            await self.run_jobs()    # Synchronizer and Verifier
             self.process_pending_sends()
         self.stop_network()
         self.on_stop()
@@ -1094,8 +1042,7 @@ class Network(util.DaemonThread):
             self.notify('updated')
             self.notify('interfaces')
             return
-        with self.blockchains_lock:
-            tip = max([x.height() for x in self.blockchains.values()])
+        tip = max([x.height() for x in self.blockchains.values()])
         if tip >=0:
             interface.mode = 'backward'
             interface.bad = height
@@ -1107,23 +1054,19 @@ class Network(util.DaemonThread):
                 chain.catch_up = interface
                 interface.mode = 'catch_up'
                 interface.blockchain = chain
-                with self.blockchains_lock:
-                    self.print_error("switching to catchup mode", tip,  self.blockchains)
+                self.print_error("switching to catchup mode", tip,  self.blockchains)
                 self.request_header(interface, 0)
             else:
                 self.print_error("chain already catching up with", chain.catch_up.server)
 
-    @with_interface_lock
     def blockchain(self):
         if self.interface and self.interface.blockchain is not None:
             self.blockchain_index = self.interface.blockchain.checkpoint
         return self.blockchains[self.blockchain_index]
 
-    @with_interface_lock
     def get_blockchains(self):
         out = {}
-        with self.blockchains_lock:
-            blockchain_items = list(self.blockchains.items())
+        blockchain_items = list(self.blockchains.items())
         for k, b in blockchain_items:
             r = list(filter(lambda i: i.blockchain==b, list(self.interfaces.values())))
             if r:
@@ -1135,8 +1078,7 @@ class Network(util.DaemonThread):
         if blockchain:
             self.blockchain_index = index
             self.config.set_key('blockchain_index', index)
-            with self.interface_lock:
-                interfaces = list(self.interfaces.values())
+            interfaces = list(self.interfaces.values())
             for i in interfaces:
                 if i.blockchain == blockchain:
                     self.switch_to_interface(i.server)
@@ -1144,12 +1086,11 @@ class Network(util.DaemonThread):
         else:
             raise Exception('blockchain not found', index)
 
-        with self.interface_lock:
-            if self.interface:
-                server = self.interface.server
-                host, port, protocol, proxy, auto_connect = self.get_parameters()
-                host, port, protocol = server.split(':')
-                self.set_parameters(host, port, protocol, proxy, auto_connect)
+        if self.interface:
+            server = self.interface.server
+            host, port, protocol, proxy, auto_connect = self.get_parameters()
+            host, port, protocol = server.split(':')
+            self.set_parameters(host, port, protocol, proxy, auto_connect)
 
     def get_local_height(self):
         return self.blockchain().height()

@@ -38,7 +38,7 @@ class SPV(ThreadJob):
         self.merkle_roots = {}  # txid -> merkle root (once it has been verified)
         self.requested_merkle = set()  # txid set of pending requests
 
-    def run(self):
+    async def run(self):
         interface = self.network.interface
         if not interface:
             return

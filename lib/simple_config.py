@@ -57,10 +57,6 @@ class SimpleConfig(PrintError):
         if options is None:
             options = {}
 
-        # This lock needs to be acquired for updating and reading the config in
-        # a thread-safe way.
-        self.lock = threading.RLock()
-
         self.mempool_fees = {}
         self.fee_estimates = {}
         self.fee_estimates_last_updated = {}
@@ -141,32 +137,29 @@ class SimpleConfig(PrintError):
         self._set_key_in_user_config(key, value, save)
 
     def _set_key_in_user_config(self, key, value, save=True):
-        with self.lock:
-            if value is not None:
-                self.user_config[key] = value
-            else:
-                self.user_config.pop(key, None)
-            if save:
-                self.save_user_config()
+        if value is not None:
+            self.user_config[key] = value
+        else:
+            self.user_config.pop(key, None)
+        if save:
+            self.save_user_config()
 
     def get(self, key, default=None):
-        with self.lock:
-            out = self.cmdline_options.get(key)
-            if out is None:
-                out = self.user_config.get(key, default)
+        out = self.cmdline_options.get(key)
+        if out is None:
+            out = self.user_config.get(key, default)
         return out
 
     def requires_upgrade(self):
         return self.get_config_version() < FINAL_CONFIG_VERSION
 
     def upgrade(self):
-        with self.lock:
-            self.print_error('upgrading config')
+        self.print_error('upgrading config')
 
-            self.convert_version_2()
-            self.convert_version_3()
+        self.convert_version_2()
+        self.convert_version_3()
 
-            self.set_key('config_version', FINAL_CONFIG_VERSION, save=True)
+        self.set_key('config_version', FINAL_CONFIG_VERSION, save=True)
 
     def convert_version_2(self):
         if not self._is_upgrade_method_needed(1, 1):

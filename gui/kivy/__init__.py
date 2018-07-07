@@ -60,3 +60,12 @@ class ElectrumGui:
                            plugins = self.plugins,
                            gui_object=self)
         w.run()
+
+    async def async_run(self):
+        from .main_window import ElectrumWindow
+        self.config.open_last_wallet()
+        w = ElectrumWindow(config=self.config,
+                           network=self.network,
+                           plugins = self.plugins,
+                           gui_object=self)
+        await w.async_run()

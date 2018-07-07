@@ -23,8 +23,11 @@
 # ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-import os
 import sys
+sys.excepthook = sys.__excepthook__
+import trio
+import os
+os.environ['KIVY_EVENTLOOP'] = 'trio'
 
 script_dir = os.path.dirname(os.path.realpath(__file__))
 is_bundle = getattr(sys, 'frozen', False)
@@ -80,9 +83,10 @@ from electrum.storage import WalletStorage, get_derivation_used_for_hw_device_en
 from electrum.util import print_msg, print_stderr, json_encode, json_decode, UserCancelled
 from electrum.util import set_verbosity, InvalidPassword
 from electrum.commands import get_parser, known_commands, Commands, config_variables
-from electrum import daemon
 from electrum import keystore
 from electrum.mnemonic import Mnemonic
+
+from asyncioapp import init_gui
 
 # get password routine
 def prompt_password(prompt, confirm=True):
@@ -326,14 +330,13 @@ def run_offline_command(config, config_options, plugins):
         wallet.storage.write()
     return result
 
-def init_plugins(config, gui_name):
+def init_plugins(config, gui_name, nursery):
     from electrum.plugins import Plugins
-    return Plugins(config, is_local or is_android, gui_name)
+    return Plugins(config, is_local or is_android, gui_name, nursery)
 
-
-if __name__ == '__main__':
+async def main():
     # The hook will only be used in the Qt GUI right now
-    util.setup_thread_excepthook()
+    #util.setup_thread_excepthook()
     # on macOS, delete Process Serial Number arg generated for apps launched in Finder
     sys.argv = list(filter(lambda x: not x.startswith('-psn'), sys.argv))
 
@@ -410,15 +413,11 @@ if __name__ == '__main__':
         sys.exit(0)
 
     if cmdname == 'gui':
-        fd, server = daemon.get_fd_or_server(config)
-        if fd is not None:
-            plugins = init_plugins(config, config.get('gui', 'qt'))
-            d = daemon.Daemon(config, fd, True)
-            d.start()
-            d.init_gui(config, plugins)
-            sys.exit(0)
-        else:
-            result = server.gui(config_options)
+        async with trio.open_nursery() as nursery:
+            plugins = init_plugins(config, config.get('gui', 'qt'), nursery)
+            init_gui(config, plugins, nursery)
+            pass
+        sys.exit(0)
 
     elif cmdname == 'daemon':
         subcommand = config.get('subcommand')
@@ -478,3 +477,6 @@ if __name__ == '__main__':
     elif result is not None:
         print_msg(json_encode(result))
     sys.exit(0)
+
+if __name__ == '__main__':
+    trio.run(main)

@@ -182,7 +182,7 @@ class ThreadJob(PrintError):
     called from that thread's context.
     """
 
-    def run(self):
+    async def run(self):
         """Called periodically from the thread"""
         pass
 
@@ -206,54 +206,46 @@ class DebugMem(ThreadJob):
             self.print_error("%s: %d" % (class_.__name__, len(objs)))
         self.print_error("Finish memscan")
 
-    def run(self):
+    async def run(self):
         if time.time() > self.next_time:
             self.mem_stats()
             self.next_time = time.time() + self.interval
 
-class DaemonThread(threading.Thread, PrintError):
+class DaemonThread(PrintError):
     """ daemon thread that terminates cleanly """
 
-    def __init__(self):
-        threading.Thread.__init__(self)
+    def __init__(self, nursery):
         self.parent_thread = threading.currentThread()
         self.running = False
-        self.running_lock = threading.Lock()
-        self.job_lock = threading.Lock()
         self.jobs = []
+        self.nursery = nursery
 
     def add_jobs(self, jobs):
-        with self.job_lock:
-            self.jobs.extend(jobs)
+        self.jobs.extend(jobs)
 
-    def run_jobs(self):
+    async def run_jobs(self):
         # Don't let a throwing job disrupt the thread, future runs of
         # itself, or other jobs.  This is useful protection against
         # malformed or malicious server responses
-        with self.job_lock:
-            for job in self.jobs:
-                try:
-                    job.run()
-                except Exception as e:
-                    traceback.print_exc(file=sys.stderr)
+        for job in self.jobs:
+            try:
+                await job.run()
+            except Exception as e:
+                traceback.print_exc(file=sys.stderr)
 
     def remove_jobs(self, jobs):
-        with self.job_lock:
-            for job in jobs:
-                self.jobs.remove(job)
+        for job in jobs:
+            self.jobs.remove(job)
 
     def start(self):
-        with self.running_lock:
-            self.running = True
-        return threading.Thread.start(self)
+        self.running = True
+        self.nursery.start_soon(self.run)
 
     def is_running(self):
-        with self.running_lock:
-            return self.running and self.parent_thread.is_alive()
+        return self.running
 
     def stop(self):
-        with self.running_lock:
-            self.running = False
+        self.running = False
 
     def on_stop(self):
         if 'ANDROID_DATA' in os.environ:

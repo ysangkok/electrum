@@ -451,7 +451,7 @@ class FxThread(ThreadJob):
             rounded_amount = amount
         return fmt_str.format(rounded_amount)
 
-    def run(self):
+    async def run(self):
         # This runs from the plugins thread which catches exceptions
         if self.is_enabled():
             if self.timeout ==0 and self.show_history():

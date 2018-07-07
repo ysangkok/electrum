@@ -1,6 +1,8 @@
 Electrum - Lightweight Bitcoin client
 =====================================
 
+NOTE THIS BRANCH REQUIRES KIVY WITH AWAIT/ASYNC SUPPORT https://github.com/kivy/kivy/pull/5241
+
 ::
 
   Licence: MIT Licence

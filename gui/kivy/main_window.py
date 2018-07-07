@@ -456,7 +456,7 @@ class ElectrumWindow(App):
         #win.softinput_mode = 'below_target'
         self.on_size(win, win.size)
         self.init_ui()
-        crash_reporter.ExceptionHook(self)
+        #crash_reporter.ExceptionHook(self)
         # init plugins
         run_hook('init_kivy', self)
         # fiat currency
