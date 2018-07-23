@@ -26,6 +26,8 @@
 import os
 import json
 
+from . import bitcoin
+
 
 def read_json(filename, default):
     path = os.path.join(os.path.dirname(__file__), filename)
@@ -37,7 +39,14 @@ def read_json(filename, default):
     return r
 
 
-class BitcoinMainnet:
+class AbstractNet:
+
+    @classmethod
+    def rev_genesis_bytes(cls) -> bytes:
+        return bytes.fromhex(bitcoin.rev_hex(cls.GENESIS))
+
+
+class BitcoinMainnet(AbstractNet):
 
     TESTNET = False
     WIF_PREFIX = 0x80
@@ -66,7 +75,7 @@ class BitcoinMainnet:
     BIP44_COIN_TYPE = 0
 
 
-class BitcoinTestnet:
+class BitcoinTestnet(AbstractNet):
 
     TESTNET = True
     WIF_PREFIX = 0xef
