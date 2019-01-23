@@ -9,15 +9,15 @@ from .bitcoin import TYPE_ADDRESS, redeem_script_to_address, dust_threshold
 from . import ecc
 from .lnutil import (make_commitment_output_to_remote_address, make_commitment_output_to_local_witness_script,
                      derive_privkey, derive_pubkey, derive_blinded_pubkey, derive_blinded_privkey,
-                     make_htlc_tx_witness, make_htlc_tx_with_open_channel,
+                     make_htlc_tx_witness, make_htlc_tx_with_open_channel, UpdateAddHtlc,
                      LOCAL, REMOTE, make_htlc_output_witness_script, UnknownPaymentHash,
                      get_ordered_channel_configs, privkey_to_pubkey, get_per_commitment_secret_from_seed,
-                     RevocationStore, extract_ctn_from_tx_and_chan, UnableToDeriveSecret)
+                     RevocationStore, extract_ctn_from_tx_and_chan, UnableToDeriveSecret, SENT, RECEIVED)
 from .transaction import Transaction, TxOutput, construct_witness
 from .simple_config import SimpleConfig, FEERATE_FALLBACK_STATIC_FEE
 
 if TYPE_CHECKING:
-    from .lnchan import Channel, UpdateAddHtlc
+    from .lnchan import Channel
 
 
 def maybe_create_sweeptx_for_their_ctx_to_remote(ctx: Transaction, sweep_address: str,
@@ -106,7 +106,7 @@ def create_sweeptxs_for_their_just_revoked_ctx(chan: 'Channel', ctx: Transaction
     ctn = extract_ctn_from_tx_and_chan(ctx, chan)
     assert ctn == chan.config[REMOTE].ctn
     # received HTLCs, in their ctx
-    received_htlcs = chan.included_htlcs(REMOTE, LOCAL, False)
+    received_htlcs = chan.included_htlcs(REMOTE, RECEIVED, ctn)
     for htlc in received_htlcs:
         direct_sweep_tx, secondstage_sweep_tx, htlc_tx = create_sweeptx_for_htlc(htlc, is_received_htlc=True)
         if direct_sweep_tx:
@@ -114,7 +114,7 @@ def create_sweeptxs_for_their_just_revoked_ctx(chan: 'Channel', ctx: Transaction
         if secondstage_sweep_tx:
             txs[htlc_tx.txid()] = secondstage_sweep_tx
     # offered HTLCs, in their ctx
-    offered_htlcs = chan.included_htlcs(REMOTE, REMOTE, False)
+    offered_htlcs = chan.included_htlcs(REMOTE, SENT, ctn)
     for htlc in offered_htlcs:
         direct_sweep_tx, secondstage_sweep_tx, htlc_tx = create_sweeptx_for_htlc(htlc, is_received_htlc=False)
         if direct_sweep_tx:
@@ -181,16 +181,14 @@ def create_sweeptxs_for_our_latest_ctx(chan: 'Channel', ctx: Transaction,
             is_revocation=False)
         return htlc_tx, to_wallet_tx
     # offered HTLCs, in our ctx --> "timeout"
-    # TODO consider carefully if "included_htlcs" is what we need here
-    offered_htlcs = list(chan.included_htlcs(LOCAL, LOCAL))  # type: List[UpdateAddHtlc]
+    # received HTLCs, in our ctx --> "success"
+    offered_htlcs = chan.included_htlcs(LOCAL, SENT, ctn)  # type: List[UpdateAddHtlc]
+    received_htlcs = chan.included_htlcs(LOCAL, RECEIVED, ctn)  # type: List[UpdateAddHtlc]
     for htlc in offered_htlcs:
         htlc_tx, to_wallet_tx = create_txns_for_htlc(htlc, is_received_htlc=False)
         if htlc_tx and to_wallet_tx:
             txs[to_wallet_tx.prevout(0)] = to_wallet_tx
             txs[htlc_tx.prevout(0)] = htlc_tx
-    # received HTLCs, in our ctx --> "success"
-    # TODO consider carefully if "included_htlcs" is what we need here
-    received_htlcs = list(chan.included_htlcs(LOCAL, REMOTE))  # type: List[UpdateAddHtlc]
     for htlc in received_htlcs:
         htlc_tx, to_wallet_tx = create_txns_for_htlc(htlc, is_received_htlc=True)
         if htlc_tx and to_wallet_tx:
@@ -332,7 +330,7 @@ def create_htlctx_that_spends_from_our_ctx(chan: 'Channel', our_pcp: bytes,
                                                              htlc=htlc,
                                                              name=f'our_ctx_htlc_tx_{bh2u(htlc.payment_hash)}',
                                                              cltv_expiry=0 if is_received_htlc else htlc.cltv_expiry)
-    remote_htlc_sig = chan.get_remote_htlc_sig_for_htlc(htlc, we_receive=is_received_htlc)
+    remote_htlc_sig = chan.get_remote_htlc_sig_for_htlc(htlc, we_receive=is_received_htlc, ctx=ctx)
     local_htlc_sig = bfh(htlc_tx.sign_txin(0, local_htlc_privkey))
     txin = htlc_tx.inputs()[0]
     witness_program = bfh(Transaction.get_preimage_script(txin))
@@ -364,6 +362,7 @@ def create_sweeptx_their_ctx_htlc(ctx: Transaction, witness_script: bytes, sweep
                                   preimage: Optional[bytes], output_idx: int,
                                   privkey: bytes, is_revocation: bool, cltv_expiry: int,
                                   fee_per_kb: int=None) -> Optional[Transaction]:
+    assert type(cltv_expiry) is int
     preimage = preimage or b''  # preimage is required iff (not is_revocation and htlc is offered)
     val = ctx.outputs()[output_idx].value
     sweep_inputs = [{
@@ -383,7 +382,10 @@ def create_sweeptx_their_ctx_htlc(ctx: Transaction, witness_script: bytes, sweep
     outvalue = val - fee
     if outvalue <= dust_threshold(): return None
     sweep_outputs = [TxOutput(TYPE_ADDRESS, sweep_address, outvalue)]
-    tx = Transaction.from_io(sweep_inputs, sweep_outputs, version=2, name=f'their_ctx_sweep_htlc_{ctx.txid()[:8]}_{output_idx}', cltv_expiry=cltv_expiry)
+    tx = Transaction.from_io(sweep_inputs, sweep_outputs, version=2
+            , name=f'their_ctx_sweep_htlc_{ctx.txid()[:8]}_{output_idx}'
+            # note that cltv_expiry, and therefore also locktime will be zero when breach!
+            , cltv_expiry=cltv_expiry, locktime=cltv_expiry)
 
     sig = bfh(tx.sign_txin(0, privkey))
     if not is_revocation:
