@@ -69,7 +69,7 @@ class LNChannelVerifier(NetworkJobOnDefaultServer):
 
     # TODO make async; and rm self.lock completely
     def add_new_channel_info(self, channel_info):
-        short_channel_id = channel_info.channel_id
+        short_channel_id = bfh(channel_info.short_channel_id)
         if short_channel_id in self.unverified_channel_info:
             return
         if short_channel_id in self.blacklist:
@@ -155,7 +155,8 @@ class LNChannelVerifier(NetworkJobOnDefaultServer):
             return
         # check funding output
         channel_info = self.unverified_channel_info[short_channel_id]
-        chan_ann = channel_info.msg_payload
+        msg_type, chan_ann = lnserializer.decode_msg(channel_info.msg_payload)
+        assert msg_type == 'channel_announcement'
         redeem_script = funding_output_script_from_keys(chan_ann['bitcoin_key_1'], chan_ann['bitcoin_key_2'])
         expected_address = bitcoin.redeem_script_to_address('p2wsh', redeem_script)
         output_idx = invert_short_channel_id(short_channel_id)[2]
@@ -186,8 +187,9 @@ class LNChannelVerifier(NetworkJobOnDefaultServer):
             self.unverified_channel_info.pop(short_channel_id, None)
 
 
-def verify_sigs_for_channel_announcement(chan_ann: dict) -> bool:
-    msg_bytes = lnserializer.gen_msg('channel_announcement', **chan_ann)
+def verify_sigs_for_channel_announcement(msg_bytes: bytes) -> bool:
+    msg_type, chan_ann = lnserializer.decode_msg(msg_bytes)
+    assert msg_type == 'channel_announcement'
     pre_hash = msg_bytes[2+256:]
     h = sha256d(pre_hash)
     pubkeys = [chan_ann['node_id_1'], chan_ann['node_id_2'], chan_ann['bitcoin_key_1'], chan_ann['bitcoin_key_2']]

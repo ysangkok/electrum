@@ -231,6 +231,7 @@ class Peer(PrintError):
         # loop
         async for msg in self.transport.read_messages():
             self.process_message(msg)
+            await asyncio.sleep(.01)
             self.ping_if_required()
 
     def close_and_cleanup(self):

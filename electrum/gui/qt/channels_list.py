@@ -16,6 +16,8 @@ from .channel_details import ChannelDetailsDialog
 class ChannelsList(MyTreeView):
     update_rows = QtCore.pyqtSignal()
     update_single_row = QtCore.pyqtSignal(Channel)
+    nodes_sig = QtCore.pyqtSignal(int)
+    chans_sig = QtCore.pyqtSignal(int)
 
     def __init__(self, parent):
         super().__init__(parent, self.create_menu, 0)
@@ -24,6 +26,12 @@ class ChannelsList(MyTreeView):
         self.update_rows.connect(self.do_update_rows)
         self.update_single_row.connect(self.do_update_single_row)
         self.status = QLabel('')
+
+        self.num_channels = 0
+        self.num_nodes = 0
+
+        self.nodes_sig.connect(self.upd_num_nodes)
+        self.chans_sig.connect(self.upd_num_channels)
 
     def format_fields(self, chan):
         labels = {}
@@ -105,25 +113,35 @@ class ChannelsList(MyTreeView):
 
     def update_status(self):
         channel_db = self.parent.network.channel_db
-        num_nodes = len(channel_db.nodes)
-        num_channels = len(channel_db)
+        channel_db.num_nodes(self.nodes_sig)
+        channel_db.num_channels(self.chans_sig)
+
+    @QtCore.pyqtSlot(int)
+    def upd_num_nodes(self, nodes):
+        self.num_nodes = nodes
+        self.update_status_in_gui()
+
+    @QtCore.pyqtSlot(int)
+    def upd_num_channels(self, channels):
+        self.num_channels = channels
+        self.update_status_in_gui()
+
+    def update_status_in_gui(self):
         num_peers = len(self.parent.wallet.lnworker.peers)
-        msg = _('{} peers, {} nodes, {} channels.').format(num_peers, num_nodes, num_channels)
+        msg = _('{} peers, {} nodes, {} channels.').format(num_peers, self.num_nodes, self.num_channels)
         self.status.setText(msg)
 
     def statistics_dialog(self):
         channel_db = self.parent.network.channel_db
-        num_nodes = len(channel_db.nodes)
-        num_channels = len(channel_db)
         capacity = self.parent.format_amount(channel_db.capacity()) + ' '+ self.parent.base_unit()
         d = WindowModalDialog(self.parent, _('Lightning Network Statistics'))
         d.setMinimumWidth(400)
         vbox = QVBoxLayout(d)
         h = QGridLayout()
         h.addWidget(QLabel(_('Nodes') + ':'), 0, 0)
-        h.addWidget(QLabel('{}'.format(num_nodes)), 0, 1)
+        h.addWidget(QLabel('{}'.format(self.num_nodes)), 0, 1)
         h.addWidget(QLabel(_('Channels') + ':'), 1, 0)
-        h.addWidget(QLabel('{}'.format(num_channels)), 1, 1)
+        h.addWidget(QLabel('{}'.format(self.num_channels)), 1, 1)
         h.addWidget(QLabel(_('Capacity') + ':'), 2, 0)
         h.addWidget(QLabel(capacity), 2, 1)
         vbox.addLayout(h)
