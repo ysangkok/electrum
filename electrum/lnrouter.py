@@ -35,6 +35,15 @@ import binascii
 import base64
 import asyncio
 
+from sqlalchemy import create_engine, event, Column, ForeignKey, Integer, String, DateTime, Boolean
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import relationship
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm.query import Query
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.sql import not_, or_
+from sqlalchemy.orm import scoped_session
+
 from . import constants
 from .util import PrintError, bh2u, profiler, get_headers_dir, bfh, is_ip_address, list_enabled_bits
 from .storage import JsonDB
@@ -59,26 +68,211 @@ def validate_features(features : int):
         if (1 << fbit) not in LN_GLOBAL_FEATURES_KNOWN_SET and fbit % 2 == 0:
             raise UnknownEvenFeatureBits()
 
-from sqlalchemy import create_engine, event, Column, ForeignKey, Integer, String, DateTime, Boolean
-from sqlalchemy.engine import Engine
-from sqlalchemy.orm import relationship
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.orm.query import Query
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.sql import not_, or_
+Base = declarative_base()
+session_factory = sessionmaker()
+DBSession = scoped_session(session_factory)
+engine = None
+
+FLAG_DISABLE   = 1 << 1
+FLAG_DIRECTION = 1 << 0
+
+class ChannelInfoInDB(Base):
+    __tablename__ = 'channel_info'
+    short_channel_id = Column(String(64), primary_key=True)
+    node1_id = Column(String(66), ForeignKey('node_info.node_id'), nullable=False)
+    node2_id = Column(String(66), ForeignKey('node_info.node_id'), nullable=False)
+    capacity_sat = Column(Integer)
+    msg_payload_hex = Column(String(1024), nullable=False)
+    trusted = Column(Boolean, nullable=False)
+
+    @staticmethod
+    def from_msg(channel_announcement_payload):
+        features = int.from_bytes(channel_announcement_payload['features'], 'big')
+        validate_features(features)
+
+        channel_id = channel_announcement_payload['short_channel_id'].hex()
+        node_id_1 = channel_announcement_payload['node_id_1'].hex()
+        node_id_2 = channel_announcement_payload['node_id_2'].hex()
+        assert list(sorted([node_id_1, node_id_2])) == [node_id_1, node_id_2]
+
+        msg_payload_hex = serializer.gen_msg('channel_announcement', **channel_announcement_payload).hex()
+
+        capacity_sat = None
+
+        return ChannelInfoInDB(short_channel_id = channel_id, node1_id = node_id_1,
+                node2_id = node_id_2, capacity_sat = capacity_sat, msg_payload_hex = msg_payload_hex,
+                trusted = False)
+
+    @property
+    def msg_payload(self):
+        return bytes.fromhex(self.msg_payload_hex)
+
+    def on_channel_update(self, msg, trusted=False):
+        assert self.short_channel_id == msg['short_channel_id'].hex()
+        flags = int.from_bytes(msg['channel_flags'], 'big')
+        direction = flags & FLAG_DIRECTION
+        if direction == 0:
+            node_id = self.node1_id
+        else:
+            node_id = self.node2_id
+        new_policy = Policy.from_msg(msg, node_id, self.short_channel_id)
+        old_policy = DBSession.query(Policy).filter_by(short_channel_id = self.short_channel_id, start_node=node_id).one_or_none()
+        if not old_policy:
+            DBSession.add(new_policy)
+            return
+        if old_policy.timestamp >= new_policy.timestamp:
+            return  # ignore
+        if not trusted and not verify_sig_for_channel_update(msg, bytes.fromhex(node_id)):
+            return  # ignore
+        old_policy.cltv_expiry_delta           = new_policy.cltv_expiry_delta
+        old_policy.htlc_minimum_msat           = new_policy.htlc_minimum_msat
+        old_policy.htlc_maximum_msat           = new_policy.htlc_maximum_msat
+        old_policy.fee_base_msat               = new_policy.fee_base_msat
+        old_policy.fee_proportional_millionths = new_policy.fee_proportional_millionths
+        old_policy.channel_flags               = new_policy.channel_flags
+        old_policy.timestamp                   = new_policy.timestamp
+
+    def get_policy_for_node(self, node) -> Optional['Policy']:
+        """
+        raises when initiator/non-initiator both unequal node
+        """
+        if node.hex() not in (self.node1_id, self.node2_id):
+            raise Exception("the given node is not a party in this channel")
+        n1 = DBSession.query(Policy).filter_by(short_channel_id = self.short_channel_id, start_node = self.node1_id).one_or_none()
+        if n1:
+            return n1
+        n2 = DBSession.query(Policy).filter_by(short_channel_id = self.short_channel_id, start_node = self.node2_id).one_or_none()
+        return n2
+
+class Policy(Base):
+    __tablename__ = 'policy'
+    start_node                  = Column(String(66), ForeignKey('node_info.node_id'), primary_key=True)
+    short_channel_id            = Column(String(64), ForeignKey('channel_info.short_channel_id'), primary_key=True)
+    cltv_expiry_delta           = Column(Integer, nullable=False)
+    htlc_minimum_msat           = Column(Integer, nullable=False)
+    htlc_maximum_msat           = Column(Integer)
+    fee_base_msat               = Column(Integer, nullable=False)
+    fee_proportional_millionths = Column(Integer, nullable=False)
+    channel_flags               = Column(Integer, nullable=False)
+    timestamp                   = Column(DateTime, nullable=False)
+
+    @staticmethod
+    def from_msg(channel_update_payload, start_node, short_channel_id):
+        cltv_expiry_delta           = channel_update_payload['cltv_expiry_delta']
+        htlc_minimum_msat           = channel_update_payload['htlc_minimum_msat']
+        fee_base_msat               = channel_update_payload['fee_base_msat']
+        fee_proportional_millionths = channel_update_payload['fee_proportional_millionths']
+        channel_flags               = channel_update_payload['channel_flags']
+        timestamp                   = channel_update_payload['timestamp']
+        htlc_maximum_msat           = channel_update_payload.get('htlc_maximum_msat')  # optional
+
+        cltv_expiry_delta           = int.from_bytes(cltv_expiry_delta, "big")
+        htlc_minimum_msat           = int.from_bytes(htlc_minimum_msat, "big")
+        htlc_maximum_msat           = int.from_bytes(htlc_maximum_msat, "big") if htlc_maximum_msat else None
+        fee_base_msat               = int.from_bytes(fee_base_msat, "big")
+        fee_proportional_millionths = int.from_bytes(fee_proportional_millionths, "big")
+        channel_flags               = int.from_bytes(channel_flags, "big")
+        timestamp                   = datetime.datetime.fromtimestamp(int.from_bytes(timestamp, "big"))
+
+        return Policy(start_node=start_node,
+                short_channel_id=short_channel_id,
+                cltv_expiry_delta=cltv_expiry_delta,
+                htlc_minimum_msat=htlc_minimum_msat,
+                fee_base_msat=fee_base_msat,
+                fee_proportional_millionths=fee_proportional_millionths,
+                channel_flags=channel_flags,
+                timestamp=timestamp,
+                htlc_maximum_msat=htlc_maximum_msat)
+
+    def is_disabled(self):
+        return self.channel_flags & FLAG_DISABLE
+
+class NodeInfoInDB(Base):
+    __tablename__ = 'node_info'
+    node_id = Column(String(66), primary_key=True, sqlite_on_conflict_primary_key='REPLACE')
+    features = Column(Integer, nullable=False)
+    timestamp = Column(Integer, nullable=False)
+    alias = Column(String(64), nullable=False)
+
+    @property
+    def addresses(self):
+        return DBSession.query(AddressInDB).join(NodeInfoInDB).filter_by(node_id = self.node_id).all()
+
+    @staticmethod
+    def from_msg(node_announcement_payload, addresses_already_parsed=False):
+        node_id = node_announcement_payload['node_id'].hex()
+        features = int.from_bytes(node_announcement_payload['features'], "big")
+        validate_features(features)
+        if not addresses_already_parsed:
+            addresses = NodeInfoInDB.parse_addresses_field(node_announcement_payload['addresses'])
+        else:
+            addresses = node_announcement_payload['addresses']
+        alias = node_announcement_payload['alias'].rstrip(b'\x00').hex()
+        timestamp = datetime.datetime.fromtimestamp(int.from_bytes(node_announcement_payload['timestamp'], "big"))
+        return NodeInfoInDB(node_id=node_id, features=features, timestamp=timestamp, alias=alias), [AddressInDB(host=host, port=port, node_id=node_id, last_connected_date=datetime.datetime.now()) for host, port in addresses]
+
+    @staticmethod
+    def parse_addresses_field(addresses_field):
+        buf = addresses_field
+        def read(n):
+            nonlocal buf
+            data, buf = buf[0:n], buf[n:]
+            return data
+        addresses = []
+        while buf:
+            atype = ord(read(1))
+            if atype == 0:
+                pass
+            elif atype == 1:  # IPv4
+                ipv4_addr = '.'.join(map(lambda x: '%d' % x, read(4)))
+                port = int.from_bytes(read(2), 'big')
+                if is_ip_address(ipv4_addr) and port != 0:
+                    addresses.append((ipv4_addr, port))
+            elif atype == 2:  # IPv6
+                ipv6_addr = b':'.join([binascii.hexlify(read(2)) for i in range(8)])
+                ipv6_addr = ipv6_addr.decode('ascii')
+                port = int.from_bytes(read(2), 'big')
+                if is_ip_address(ipv6_addr) and port != 0:
+                    addresses.append((ipv6_addr, port))
+            elif atype == 3:  # onion v2
+                host = base64.b32encode(read(10)) + b'.onion'
+                host = host.decode('ascii').lower()
+                port = int.from_bytes(read(2), 'big')
+                addresses.append((host, port))
+            elif atype == 4:  # onion v3
+                host = base64.b32encode(read(35)) + b'.onion'
+                host = host.decode('ascii').lower()
+                port = int.from_bytes(read(2), 'big')
+                addresses.append((host, port))
+            else:
+                # unknown address type
+                # we don't know how long it is -> have to escape
+                # if there are other addresses we could have parsed later, they are lost.
+                break
+        return addresses
+
+class AddressInDB(Base):
+    __tablename__ = 'address'
+    node_id = Column(String(66), ForeignKey('node_info.node_id'), primary_key=True)
+    host = Column(String(256), primary_key=True)
+    port = Column(Integer, primary_key=True)
+    last_connected_date = Column(DateTime(), nullable=False)
 
 class ChannelDB:
 
-    FLAG_DISABLE   = 1 << 1
-    FLAG_DIRECTION = 1 << 0
     NUM_MAX_RECENT_PEERS = 20
 
     def __init__(self, network: 'Network'):
+        global engine
         self.network = network
 
         self.path = os.path.join(get_headers_dir(network.config), 'channel_db.sqlite3')
         engine = create_engine('sqlite:///' + self.path)#, echo=True)
-        Base = declarative_base(engine)
+        DBSession.remove()
+        DBSession.configure(bind=engine, autoflush=False)
+
+        Base.metadata.drop_all(engine)
+        Base.metadata.create_all(engine)
 
         self.lock = threading.RLock()
 
@@ -87,224 +281,33 @@ class ChannelDB:
 
         self.ca_verifier = LNChannelVerifier(network, self)
 
-        class ChannelInfoInDB(Base):
-            __tablename__ = 'channel_info'
-            short_channel_id = Column(String(64), primary_key=True)
-            node1_id = Column(String(66), ForeignKey('node_info.node_id'), nullable=False)
-            node2_id = Column(String(66), ForeignKey('node_info.node_id'), nullable=False)
-            capacity_sat = Column(Integer)
-            msg_payload_hex = Column(String(1024), nullable=False)
-            trusted = Column(Boolean, nullable=False)
-
-            @staticmethod
-            def from_msg(channel_announcement_payload):
-                features = int.from_bytes(channel_announcement_payload['features'], 'big')
-                validate_features(features)
-
-                channel_id = channel_announcement_payload['short_channel_id'].hex()
-                node_id_1 = channel_announcement_payload['node_id_1'].hex()
-                node_id_2 = channel_announcement_payload['node_id_2'].hex()
-                assert list(sorted([node_id_1, node_id_2])) == [node_id_1, node_id_2]
-
-                msg_payload_hex = serializer.gen_msg('channel_announcement', **channel_announcement_payload).hex()
-
-                capacity_sat = None
-
-                return self.ChannelInfoInDB(short_channel_id = channel_id, node1_id = node_id_1,
-                        node2_id = node_id_2, capacity_sat = capacity_sat, msg_payload_hex = msg_payload_hex,
-                        trusted = False)
-
-            @property
-            def msg_payload(self2):
-                return bytes.fromhex(self2.msg_payload_hex)
-
-            def on_channel_update(self2, msg_payload, trusted=False):
-                assert self2.short_channel_id == msg_payload['short_channel_id'].hex()
-                flags = int.from_bytes(msg_payload['channel_flags'], 'big')
-                direction = flags & self.FLAG_DIRECTION
-                if direction == 0:
-                    node_id = self2.node1_id
-                else:
-                    node_id = self2.node2_id
-                new_policy = self.Policy.from_msg(msg_payload, node_id, self2.short_channel_id)
-                old_policy = self.sess.query(self.Policy).filter_by(short_channel_id = self2.short_channel_id, start_node=node_id).one_or_none()
-                if not old_policy:
-                    self.sess.add(new_policy)
-                    return
-                if old_policy.timestamp >= new_policy.timestamp:
-                    return  # ignore
-                if not trusted and not verify_sig_for_channel_update(msg_payload, bytes.fromhex(node_id)):
-                    return  # ignore
-                old_policy.cltv_expiry_delta           = new_policy.cltv_expiry_delta
-                old_policy.htlc_minimum_msat           = new_policy.htlc_minimum_msat
-                old_policy.htlc_maximum_msat           = new_policy.htlc_maximum_msat
-                old_policy.fee_base_msat               = new_policy.fee_base_msat
-                old_policy.fee_proportional_millionths = new_policy.fee_proportional_millionths
-                old_policy.channel_flags               = new_policy.channel_flags
-                old_policy.timestamp                   = new_policy.timestamp
-
-            def get_policy_for_node(self2, node) -> Optional['Policy']:
-                """
-                raises when initiator/non-initiator both unequal node
-                """
-                if node.hex() not in (self2.node1_id, self2.node2_id):
-                    raise Exception("the given node is not a party in this channel")
-                n1 = self.sess.query(Policy).filter_by(short_channel_id = self2.short_channel_id, start_node = self2.node1_id).one_or_none()
-                if n1:
-                    return n1
-                n2 = self.sess.query(Policy).filter_by(short_channel_id = self2.short_channel_id, start_node = self2.node2_id).one_or_none()
-                return n2
-        self.ChannelInfoInDB = ChannelInfoInDB
-
-        class Policy(Base):
-            __tablename__ = 'policy'
-            start_node                  = Column(String(66), ForeignKey('node_info.node_id'), primary_key=True)
-            short_channel_id            = Column(String(64), ForeignKey('channel_info.short_channel_id'), primary_key=True)
-            cltv_expiry_delta           = Column(Integer, nullable=False)
-            htlc_minimum_msat           = Column(Integer, nullable=False)
-            htlc_maximum_msat           = Column(Integer)
-            fee_base_msat               = Column(Integer, nullable=False)
-            fee_proportional_millionths = Column(Integer, nullable=False)
-            channel_flags               = Column(Integer, nullable=False)
-            timestamp                   = Column(DateTime, nullable=False)
-
-            @staticmethod
-            def from_msg(channel_update_payload, start_node, short_channel_id):
-                cltv_expiry_delta           = channel_update_payload['cltv_expiry_delta']
-                htlc_minimum_msat           = channel_update_payload['htlc_minimum_msat']
-                fee_base_msat               = channel_update_payload['fee_base_msat']
-                fee_proportional_millionths = channel_update_payload['fee_proportional_millionths']
-                channel_flags               = channel_update_payload['channel_flags']
-                timestamp                   = channel_update_payload['timestamp']
-                htlc_maximum_msat           = channel_update_payload.get('htlc_maximum_msat')  # optional
-
-                cltv_expiry_delta           = int.from_bytes(cltv_expiry_delta, "big")
-                htlc_minimum_msat           = int.from_bytes(htlc_minimum_msat, "big")
-                htlc_maximum_msat           = int.from_bytes(htlc_maximum_msat, "big") if htlc_maximum_msat else None
-                fee_base_msat               = int.from_bytes(fee_base_msat, "big")
-                fee_proportional_millionths = int.from_bytes(fee_proportional_millionths, "big")
-                channel_flags               = int.from_bytes(channel_flags, "big")
-                timestamp                   = datetime.datetime.fromtimestamp(int.from_bytes(timestamp, "big"))
-
-                return Policy(start_node=start_node,
-                        short_channel_id=short_channel_id,
-                        cltv_expiry_delta=cltv_expiry_delta,
-                        htlc_minimum_msat=htlc_minimum_msat,
-                        fee_base_msat=fee_base_msat,
-                        fee_proportional_millionths=fee_proportional_millionths,
-                        channel_flags=channel_flags,
-                        timestamp=timestamp,
-                        htlc_maximum_msat=htlc_maximum_msat)
-
-            @property
-            def disabled(self2):
-                return self2.channel_flags & self.FLAG_DISABLE
-        self.Policy = Policy
-
-        class NodeInfoInDB(Base):
-            __tablename__ = 'node_info'
-            node_id = Column(String(66), primary_key=True, sqlite_on_conflict_primary_key='REPLACE')
-            features = Column(Integer, nullable=False)
-            timestamp = Column(Integer, nullable=False)
-            alias = Column(String(64), nullable=False)
-
-            @property
-            def addresses(self2):
-                return self.sess.query(self.AddressInDB).join(self.NodeInfoInDB).filter_by(node_id = self2.node_id).all()
-
-            @staticmethod
-            def from_msg(node_announcement_payload, addresses_already_parsed=False):
-                node_id = node_announcement_payload['node_id'].hex()
-                features = int.from_bytes(node_announcement_payload['features'], "big")
-                validate_features(features)
-                if not addresses_already_parsed:
-                    addresses = NodeInfoInDB.parse_addresses_field(node_announcement_payload['addresses'])
-                else:
-                    addresses = node_announcement_payload['addresses']
-                alias = node_announcement_payload['alias'].rstrip(b'\x00').hex()
-                timestamp = datetime.datetime.fromtimestamp(int.from_bytes(node_announcement_payload['timestamp'], "big"))
-                return NodeInfoInDB(node_id=node_id, features=features, timestamp=timestamp, alias=alias), [self.AddressInDB(host=host, port=port, node_id=node_id, last_connected_date=datetime.datetime.now()) for host, port in addresses]
-
-            @staticmethod
-            def parse_addresses_field(addresses_field):
-                buf = addresses_field
-                def read(n):
-                    nonlocal buf
-                    data, buf = buf[0:n], buf[n:]
-                    return data
-                addresses = []
-                while buf:
-                    atype = ord(read(1))
-                    if atype == 0:
-                        pass
-                    elif atype == 1:  # IPv4
-                        ipv4_addr = '.'.join(map(lambda x: '%d' % x, read(4)))
-                        port = int.from_bytes(read(2), 'big')
-                        if is_ip_address(ipv4_addr) and port != 0:
-                            addresses.append((ipv4_addr, port))
-                    elif atype == 2:  # IPv6
-                        ipv6_addr = b':'.join([binascii.hexlify(read(2)) for i in range(8)])
-                        ipv6_addr = ipv6_addr.decode('ascii')
-                        port = int.from_bytes(read(2), 'big')
-                        if is_ip_address(ipv6_addr) and port != 0:
-                            addresses.append((ipv6_addr, port))
-                    elif atype == 3:  # onion v2
-                        host = base64.b32encode(read(10)) + b'.onion'
-                        host = host.decode('ascii').lower()
-                        port = int.from_bytes(read(2), 'big')
-                        addresses.append((host, port))
-                    elif atype == 4:  # onion v3
-                        host = base64.b32encode(read(35)) + b'.onion'
-                        host = host.decode('ascii').lower()
-                        port = int.from_bytes(read(2), 'big')
-                        addresses.append((host, port))
-                    else:
-                        # unknown address type
-                        # we don't know how long it is -> have to escape
-                        # if there are other addresses we could have parsed later, they are lost.
-                        break
-                return addresses
-        self.NodeInfoInDB = NodeInfoInDB
-
-        class AddressInDB(Base):
-            __tablename__ = 'address'
-            node_id = Column(String(66), ForeignKey('node_info.node_id'), primary_key=True)
-            host = Column(String(256), primary_key=True)
-            port = Column(Integer, primary_key=True)
-            last_connected_date = Column(DateTime(), nullable=False)
-        self.AddressInDB = AddressInDB
-
-        self.sess = sessionmaker()(autoflush=False)
-        Base.metadata.drop_all()
-        Base.metadata.create_all(engine)
-
     def num_channels(self, sig):
         # NOTE: don't need result, result will come back over the signal!
         asyncio.run_coroutine_threadsafe(self._num_channels(sig), self.network.asyncio_loop)
 
     async def _num_channels(self, sig):
-        return sig.emit(self.sess.query(self.ChannelInfoInDB).count())
+        return sig.emit(DBSession.query(ChannelInfoInDB).count())
 
     def num_nodes(self, sig):
         # NOTE: don't need result, result will come back over the signal!
         asyncio.run_coroutine_threadsafe(self._num_nodes(sig), self.network.asyncio_loop)
 
     async def _num_nodes(self, sig):
-        return sig.emit(self.sess.query(self.NodeInfoInDB).count())
+        return sig.emit(DBSession.query(NodeInfoInDB).count())
 
     def add_recent_peer(self, peer : LNPeerAddr):
-        addr = self.sess.query(self.AddressInDB).filter_by(node_id = peer.pubkey.hex()).one_or_none()
+        addr = DBSession.query(AddressInDB).filter_by(node_id = peer.pubkey.hex()).one_or_none()
         if addr is None:
-            addr = self.AddressInDB(node_id = peer.pubkey.hex(), host = peer.host, port = peer.port, last_connected_date = datetime.datetime.now())
+            addr = AddressInDB(node_id = peer.pubkey.hex(), host = peer.host, port = peer.port, last_connected_date = datetime.datetime.now())
         else:
             addr.last_connected_date = datetime.datetime.now()
-        self.sess.add(addr)
-        self.sess.commit()
+        DBSession.add(addr)
+        DBSession.commit()
 
     def get_200_randomly_sorted_nodes_not_in(self, node_ids_bytes):
-        unshuffled = self.sess \
-            .query(self.NodeInfoInDB) \
-            .filter(not_(self.NodeInfoInDB.node_id.in_(x.hex() for x in node_ids_bytes))) \
+        unshuffled = DBSession \
+            .query(NodeInfoInDB) \
+            .filter(not_(NodeInfoInDB.node_id.in_(x.hex() for x in node_ids_bytes))) \
             .limit(200) \
             .all()
         return random.sample(unshuffled, len(unshuffled))
@@ -313,26 +316,26 @@ class ChannelDB:
         return self.network.run_from_another_thread(self._nodes_get(node_id))
 
     async def _nodes_get(self, node_id):
-        return self.sess \
-            .query(self.NodeInfoInDB) \
+        return DBSession \
+            .query(NodeInfoInDB) \
             .filter_by(node_id = node_id.hex()) \
             .one_or_none()
 
     def get_last_good_address(self, node_id) -> Optional[LNPeerAddr]:
-        adr_db = self.sess \
-            .query(self.AddressInDB) \
+        adr_db = DBSession \
+            .query(AddressInDB) \
             .filter_by(node_id = node_id.hex()) \
-            .order_by(self.AddressInDB.last_connected_date.desc()) \
+            .order_by(AddressInDB.last_connected_date.desc()) \
             .one_or_none()
         if not adr_db:
             return None
         return LNPeerAddr(adr_db.host, adr_db.port, bytes.fromhex(adr_db.node_id))
 
     def get_recent_peers(self):
-        return [LNPeerAddr(x.host, x.port, bytes.fromhex(x.node_id)) for x in self.sess \
-            .query(self.AddressInDB) \
-            .select_from(self.NodeInfoInDB) \
-            .order_by(self.AddressInDB.last_connected_date.desc()) \
+        return [LNPeerAddr(x.host, x.port, bytes.fromhex(x.node_id)) for x in DBSession \
+            .query(AddressInDB) \
+            .select_from(NodeInfoInDB) \
+            .order_by(AddressInDB.last_connected_date.desc()) \
             .limit(self.NUM_MAX_RECENT_PEERS)]
 
     def get_channel_info(self, channel_id: bytes):
@@ -341,9 +344,9 @@ class ChannelDB:
     def get_channels_for_node(self, node_id):
         """Returns the set of channels that have node_id as one of the endpoints."""
         condition = or_(
-                 self.ChannelInfoInDB.node1_id == node_id.hex(),
-                 self.ChannelInfoInDB.node2_id == node_id.hex())
-        rows = self.sess.query(self.ChannelInfoInDB).filter(condition).all()
+                 ChannelInfoInDB.node1_id == node_id.hex(),
+                 ChannelInfoInDB.node2_id == node_id.hex())
+        rows = DBSession.query(ChannelInfoInDB).filter(condition).all()
         return [bytes.fromhex(x.short_channel_id) for x in rows]
 
     def add_verified_channel_info(self, short_id, capacity):
@@ -351,31 +354,35 @@ class ChannelDB:
         channel_info = self.get_channel_info(short_id)
         channel_info.trusted = True
         channel_info.capacity = capacity
-        self.sess.commit()
+        DBSession.commit()
 
     @profiler
     def on_channel_announcement(self, msg_payloads, trusted=False):
-        for msg_payload in msg_payloads:
-            short_channel_id = msg_payload['short_channel_id']
-            if self.sess.query(self.ChannelInfoInDB).filter_by(short_channel_id = bh2u(short_channel_id)).count():
+        if type(msg_payloads) is dict:
+            msg_payloads = [msg_payloads]
+        for msg in msg_payloads:
+            short_channel_id = msg['short_channel_id']
+            if DBSession.query(ChannelInfoInDB).filter_by(short_channel_id = bh2u(short_channel_id)).count():
                 continue
-            if constants.net.rev_genesis_bytes() != msg_payload['chain_hash']:
+            if constants.net.rev_genesis_bytes() != msg['chain_hash']:
                 #self.print_error("ChanAnn has unexpected chain_hash {}".format(bh2u(msg_payload['chain_hash'])))
                 continue
             try:
-                channel_info = self.ChannelInfoInDB.from_msg(msg_payload)
+                channel_info = ChannelInfoInDB.from_msg(msg)
             except UnknownEvenFeatureBits:
                 continue
             channel_info.trusted = trusted
-            self.sess.add(channel_info)
+            DBSession.add(channel_info)
             if not trusted: self.ca_verifier.add_new_channel_info(channel_info.short_channel_id, channel_info.msg_payload)
-        self.sess.commit()
+        DBSession.commit()
         self.network.trigger_callback('ln_status')
 
     @profiler
     def on_channel_update(self, msg_payloads, trusted=False):
+        if type(msg_payloads) is dict:
+            msg_payloads = [msg_payloads]
         short_channel_ids = [msg_payload['short_channel_id'].hex() for msg_payload in msg_payloads]
-        channel_infos_list = self.sess.query(self.ChannelInfoInDB).filter(self.ChannelInfoInDB.short_channel_id.in_(short_channel_ids)).all()
+        channel_infos_list = DBSession.query(ChannelInfoInDB).filter(ChannelInfoInDB.short_channel_id.in_(short_channel_ids)).all()
         channel_infos = {bfh(x.short_channel_id): x for x in channel_infos_list}
         for msg_payload in msg_payloads:
             short_channel_id = msg_payload['short_channel_id']
@@ -383,16 +390,18 @@ class ChannelDB:
                 continue
             channel_info = channel_infos.get(short_channel_id)
             channel_info.on_channel_update(msg_payload, trusted=trusted)
-        self.sess.commit()
+        DBSession.commit()
 
     @profiler
     def on_node_announcement(self, msg_payloads):
-        addresses = self.sess.query(self.AddressInDB).all()
+        if type(msg_payloads) is dict:
+            msg_payloads = [msg_payloads]
+        addresses = DBSession.query(AddressInDB).all()
         have_addr = {}
         for addr in addresses:
             have_addr[(addr.node_id, addr.host, addr.port)] = addr
 
-        nodes = self.sess.query(self.NodeInfoInDB).all()
+        nodes = DBSession.query(NodeInfoInDB).all()
         timestamps = {}
         for node in nodes:
             no_millisecs = node.timestamp[:len("0000-00-00 00:00:00")]
@@ -405,12 +414,12 @@ class ChannelDB:
             if not ecc.verify_signature(pubkey, signature, h):
                 continue
             try:
-                new_node_info, addresses = self.NodeInfoInDB.from_msg(msg_payload)
+                new_node_info, addresses = NodeInfoInDB.from_msg(msg_payload)
             except UnknownEvenFeatureBits:
                 continue
             if timestamps.get(pubkey) and timestamps[pubkey] >= new_node_info.timestamp:
                 continue  # ignore
-            self.sess.add(new_node_info)
+            DBSession.add(new_node_info)
             for new_addr in addresses:
                 key = (new_addr.node_id, new_addr.host, new_addr.port)
                 old_addr = have_addr.get(key)
@@ -418,7 +427,7 @@ class ChannelDB:
                     old_addr.last_connected_date = new_addr.last_connected_date
                     del new_addr
                 else:
-                    self.sess.add(new_addr)
+                    DBSession.add(new_addr)
                     have_addr[key] = new_addr
             # TODO if this message is for a new node, and if we have no associated
             # channels for this node, we should ignore the message and return here,
@@ -427,7 +436,7 @@ class ChannelDB:
         del nodes, addresses
         if old_addr:
             del old_addr
-        self.sess.commit()
+        DBSession.commit()
         self.network.trigger_callback('ln_status')
 
     def get_routing_policy_for_channel(self, start_node_id: bytes,
@@ -438,7 +447,7 @@ class ChannelDB:
             return channel_info.get_policy_for_node(start_node_id)
         msg = self._channel_updates_for_private_channels.get((start_node_id, short_channel_id))
         if not msg: return None
-        return self.Policy.from_msg(msg, None, short_channel_id) # won't actually be written to DB
+        return Policy.from_msg(msg, None, short_channel_id) # won't actually be written to DB
 
     def add_channel_update_for_private_channel(self, msg_payload: dict, start_node_id: bytes):
         if not verify_sig_for_channel_update(msg_payload, start_node_id):
@@ -448,10 +457,10 @@ class ChannelDB:
 
     def remove_channel(self, short_channel_id):
         self.chan_query_for_id(short_channel_id).delete('evaluate')
-        self.sess.commit()
+        DBSession.commit()
 
     def chan_query_for_id(self, short_channel_id) -> Query:
-        return self.sess.query(self.ChannelInfoInDB).filter_by(short_channel_id = short_channel_id.hex())
+        return DBSession.query(ChannelInfoInDB).filter_by(short_channel_id = short_channel_id.hex())
 
     def print_graph(self, full_ids=False):
         # used for debugging.
@@ -465,11 +474,11 @@ class ChannelDB:
             return other if full_ids else other[-4:]
 
         self.print_msg('nodes')
-        for node in self.sess.query(self.NodeInfoInDB).all():
+        for node in DBSession.query(NodeInfoInDB).all():
             self.print_msg(node)
 
         self.print_msg('channels')
-        for channel_info in self.sess.query(self.ChannelInfoInDB).all():
+        for channel_info in DBSession.query(ChannelInfoInDB).all():
             node1 = channel_info.node1_id
             node2 = channel_info.node2_id
             direction1 = channel_info.get_policy_for_node(node1) is not None
@@ -571,7 +580,7 @@ class LNPathFinder(PrintError):
 
         channel_policy = channel_info.get_policy_for_node(start_node)
         if channel_policy is None: return float('inf'), 0
-        if channel_policy.disabled: return float('inf'), 0
+        if channel_policy.is_disabled(): return float('inf'), 0
         route_edge = RouteEdge.from_channel_policy(channel_policy, short_channel_id, end_node)
         if payment_amt_msat < channel_policy.htlc_minimum_msat:
             return float('inf'), 0  # payment amount too little
