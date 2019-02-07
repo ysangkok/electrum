@@ -59,19 +59,13 @@ def validate_features(features : int):
         if (1 << fbit) not in LN_GLOBAL_FEATURES_KNOWN_SET and fbit % 2 == 0:
             raise UnknownEvenFeatureBits()
 
-from sqlalchemy import create_engine, event, Column, ForeignKey, Integer, String, DateTime
+from sqlalchemy import create_engine, event, Column, ForeignKey, Integer, String, DateTime, Boolean
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import relationship
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.orm.query import Query
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import not_, or_
-
-@event.listens_for(Engine, "connect")
-def set_sqlite_pragma(dbapi_connection, connection_record):
-    cursor = dbapi_connection.cursor()
-    cursor.execute("PRAGMA foreign_keys=ON")
-    cursor.close()
 
 class ChannelDB:
 
@@ -100,6 +94,7 @@ class ChannelDB:
             node2_id = Column(String(66), ForeignKey('node_info.node_id'), nullable=False)
             capacity_sat = Column(Integer)
             msg_payload_hex = Column(String(1024), nullable=False)
+            trusted = Column(Boolean, nullable=False)
 
             @staticmethod
             def from_msg(channel_announcement_payload):
@@ -116,15 +111,12 @@ class ChannelDB:
                 capacity_sat = None
 
                 return self.ChannelInfoInDB(short_channel_id = channel_id, node1_id = node_id_1,
-                        node2_id = node_id_2, capacity_sat = capacity_sat, msg_payload_hex = msg_payload_hex)
+                        node2_id = node_id_2, capacity_sat = capacity_sat, msg_payload_hex = msg_payload_hex,
+                        trusted = False)
 
             @property
             def msg_payload(self2):
                 return bytes.fromhex(self2.msg_payload_hex)
-
-            def set_capacity(self2, capacity):
-                self2.capacity_sat = capacity
-                self.sess.commit()
 
             def on_channel_update(self2, msg_payload, trusted=False):
                 assert self2.short_channel_id == msg_payload['short_channel_id'].hex()
@@ -138,7 +130,6 @@ class ChannelDB:
                 old_policy = self.sess.query(self.Policy).filter_by(short_channel_id = self2.short_channel_id, start_node=node_id).one_or_none()
                 if not old_policy:
                     self.sess.add(new_policy)
-                    self.sess.commit()
                     return
                 if old_policy.timestamp >= new_policy.timestamp:
                     return  # ignore
@@ -151,7 +142,6 @@ class ChannelDB:
                 old_policy.fee_proportional_millionths = new_policy.fee_proportional_millionths
                 old_policy.channel_flags               = new_policy.channel_flags
                 old_policy.timestamp                   = new_policy.timestamp
-                self.sess.commit()
 
             def get_policy_for_node(self2, node) -> Optional['Policy']:
                 """
@@ -213,18 +203,14 @@ class ChannelDB:
 
         class NodeInfoInDB(Base):
             __tablename__ = 'node_info'
-            node_id = Column(String(66), primary_key=True)
+            node_id = Column(String(66), primary_key=True, sqlite_on_conflict_primary_key='REPLACE')
             features = Column(Integer, nullable=False)
             timestamp = Column(Integer, nullable=False)
             alias = Column(String(64), nullable=False)
 
             @property
             def addresses(self2):
-                l = self.sess.query(self.AddressInDB).join(self.NodeInfoInDB).filter_by(node_id = self2.node_id).all()
-                if len(l) == 0:
-                    assert self2.alias == b"DUMMY ALIAS".hex(), self2.alias
-                assert type(l) is list
-                return l
+                return self.sess.query(self.AddressInDB).join(self.NodeInfoInDB).filter_by(node_id = self2.node_id).all()
 
             @staticmethod
             def from_msg(node_announcement_payload, addresses_already_parsed=False):
@@ -237,7 +223,7 @@ class ChannelDB:
                     addresses = node_announcement_payload['addresses']
                 alias = node_announcement_payload['alias'].rstrip(b'\x00').hex()
                 timestamp = datetime.datetime.fromtimestamp(int.from_bytes(node_announcement_payload['timestamp'], "big"))
-                return NodeInfoInDB(node_id=node_id, features=features, timestamp=timestamp, alias=alias), [self.AddressInDB(host=host, port=port, node_id=node_id) for host, port in addresses]
+                return NodeInfoInDB(node_id=node_id, features=features, timestamp=timestamp, alias=alias), [self.AddressInDB(host=host, port=port, node_id=node_id, last_connected_date=datetime.datetime.now()) for host, port in addresses]
 
             @staticmethod
             def parse_addresses_field(addresses_field):
@@ -288,7 +274,7 @@ class ChannelDB:
             last_connected_date = Column(DateTime(), nullable=False)
         self.AddressInDB = AddressInDB
 
-        self.sess = sessionmaker()()
+        self.sess = sessionmaker()(autoflush=False)
         Base.metadata.drop_all()
         Base.metadata.create_all(engine)
 
@@ -306,17 +292,9 @@ class ChannelDB:
     async def _num_nodes(self, sig):
         return sig.emit(self.sess.query(self.NodeInfoInDB).count())
 
-    def dummy_node(self, pubkeyhex):
-        return self.NodeInfoInDB(node_id = pubkeyhex, features="00", timestamp=datetime.datetime.now(), alias=b"DUMMY ALIAS".hex())
-
     def add_recent_peer(self, peer : LNPeerAddr):
         addr = self.sess.query(self.AddressInDB).filter_by(node_id = peer.pubkey.hex()).one_or_none()
         if addr is None:
-            node = self.sess.query(self.NodeInfoInDB).filter_by(node_id = peer.pubkey.hex()).one_or_none()
-            if not node:
-                node = self.dummy_node(peer.pubkey.hex())
-                self.sess.add(node)
-                self.sess.commit()
             addr = self.AddressInDB(node_id = peer.pubkey.hex(), host = peer.host, port = peer.port, last_connected_date = datetime.datetime.now())
         else:
             addr.last_connected_date = datetime.datetime.now()
@@ -368,77 +346,89 @@ class ChannelDB:
         rows = self.sess.query(self.ChannelInfoInDB).filter(condition).all()
         return [bytes.fromhex(x.short_channel_id) for x in rows]
 
-    def add_verified_channel_info(self, short_channel_id, channel_info):
-        self.sess.add(channel_info)
+    def add_verified_channel_info(self, short_id, capacity):
+        # called from lnchannelverifier
+        channel_info = self.get_channel_info(short_id)
+        channel_info.trusted = True
+        channel_info.capacity = capacity
+        self.sess.commit()
+
+    @profiler
+    def on_channel_announcement(self, msg_payloads, trusted=False):
+        for msg_payload in msg_payloads:
+            short_channel_id = msg_payload['short_channel_id']
+            if self.sess.query(self.ChannelInfoInDB).filter_by(short_channel_id = bh2u(short_channel_id)).count():
+                continue
+            if constants.net.rev_genesis_bytes() != msg_payload['chain_hash']:
+                #self.print_error("ChanAnn has unexpected chain_hash {}".format(bh2u(msg_payload['chain_hash'])))
+                continue
+            try:
+                channel_info = self.ChannelInfoInDB.from_msg(msg_payload)
+            except UnknownEvenFeatureBits:
+                continue
+            channel_info.trusted = trusted
+            self.sess.add(channel_info)
+            if not trusted: self.ca_verifier.add_new_channel_info(channel_info.short_channel_id, channel_info.msg_payload)
         self.sess.commit()
         self.network.trigger_callback('ln_status')
 
-    def on_channel_announcement(self, msg_payload, trusted=False):
-        short_channel_id = msg_payload['short_channel_id']
-        if self.sess.query(self.ChannelInfoInDB).filter_by(short_channel_id = bh2u(short_channel_id)).count():
-            return
-        if constants.net.rev_genesis_bytes() != msg_payload['chain_hash']:
-            #self.print_error("ChanAnn has unexpected chain_hash {}".format(bh2u(msg_payload['chain_hash'])))
-            return
-        try:
-            channel_info = self.ChannelInfoInDB.from_msg(msg_payload)
-        except UnknownEvenFeatureBits:
-            return
-        added = False
-        if self.sess.query(self.NodeInfoInDB).filter_by(node_id = channel_info.node1_id).count() == 0:
-            self.sess.add(self.dummy_node(channel_info.node1_id))
-            added = True
-        if self.sess.query(self.NodeInfoInDB).filter_by(node_id = channel_info.node2_id).count() == 0:
-            self.sess.add(self.dummy_node(channel_info.node2_id))
-            added = True
-        if added:
-            self.sess.commit()
-        self.sess.add(channel_info)
-        if trusted:
-            self.add_verified_channel_info(short_channel_id, channel_info)
-        else:
-            self.ca_verifier.add_new_channel_info(channel_info)
+    @profiler
+    def on_channel_update(self, msg_payloads, trusted=False):
+        short_channel_ids = [msg_payload['short_channel_id'].hex() for msg_payload in msg_payloads]
+        channel_infos_list = self.sess.query(self.ChannelInfoInDB).filter(self.ChannelInfoInDB.short_channel_id.in_(short_channel_ids)).all()
+        channel_infos = {bfh(x.short_channel_id): x for x in channel_infos_list}
+        for msg_payload in msg_payloads:
+            short_channel_id = msg_payload['short_channel_id']
+            if constants.net.rev_genesis_bytes() != msg_payload['chain_hash']:
+                continue
+            channel_info = channel_infos.get(short_channel_id)
+            channel_info.on_channel_update(msg_payload, trusted=trusted)
         self.sess.commit()
 
-    def on_channel_update(self, msg_payload, trusted=False):
-        short_channel_id = msg_payload['short_channel_id']
-        if constants.net.rev_genesis_bytes() != msg_payload['chain_hash']:
-            return
-        # try finding channel in pending db
-        channel_info = self.ca_verifier.get_pending_channel_info(short_channel_id)
-        if channel_info is None:
-            # try finding channel in verified db
-            channel_info = self.get_channel_info(short_channel_id)
-        if channel_info is None:
-            raise NotFoundChanAnnouncementForUpdate()
-        channel_info.on_channel_update(msg_payload, trusted=trusted)
+    @profiler
+    def on_node_announcement(self, msg_payloads):
+        addresses = self.sess.query(self.AddressInDB).all()
+        have_addr = {}
+        for addr in addresses:
+            have_addr[(addr.node_id, addr.host, addr.port)] = addr
 
-    def on_node_announcement(self, msg_payload):
-        pubkey = msg_payload['node_id']
-        signature = msg_payload['signature']
-        h = sha256d(msg_payload['raw'][66:])
-        if not ecc.verify_signature(pubkey, signature, h):
-            return
-        old_node_info = self.sess.query(self.NodeInfoInDB).filter_by(node_id = pubkey.hex()).one_or_none()
-        no_millisecs = old_node_info.timestamp[:len("0000-00-00 00:00:00")]
-        old_node_info.timestamp = datetime.datetime.strptime(no_millisecs, "%Y-%m-%d %H:%M:%S")
-        try:
-            new_node_info, addresses = self.NodeInfoInDB.from_msg(msg_payload)
-        except UnknownEvenFeatureBits:
-            return
-        # TODO if this message is for a new node, and if we have no associated
-        # channels for this node, we should ignore the message and return here,
-        # to mitigate DOS. but race condition: the channels we have for this
-        # node, might be under verification in self.ca_verifier, what then?
-        if old_node_info and old_node_info.timestamp >= new_node_info.timestamp:
-            return  # ignore
-        if not old_node_info:
+        nodes = self.sess.query(self.NodeInfoInDB).all()
+        timestamps = {}
+        for node in nodes:
+            no_millisecs = node.timestamp[:len("0000-00-00 00:00:00")]
+            timestamps[bfh(node.node_id)] = datetime.datetime.strptime(no_millisecs, "%Y-%m-%d %H:%M:%S")
+        old_addr = None
+        for msg_payload in msg_payloads:
+            pubkey = msg_payload['node_id']
+            signature = msg_payload['signature']
+            h = sha256d(msg_payload['raw'][66:])
+            if not ecc.verify_signature(pubkey, signature, h):
+                continue
+            try:
+                new_node_info, addresses = self.NodeInfoInDB.from_msg(msg_payload)
+            except UnknownEvenFeatureBits:
+                continue
+            if timestamps.get(pubkey) and timestamps[pubkey] >= new_node_info.timestamp:
+                continue  # ignore
             self.sess.add(new_node_info)
-        else:
-            old_node_info.features = new_node_info.features
-            old_node_info.alias = new_node_info.alias
-        for addr in addresses: self.sess.add(addr)
+            for new_addr in addresses:
+                key = (new_addr.node_id, new_addr.host, new_addr.port)
+                old_addr = have_addr.get(key)
+                if old_addr:
+                    old_addr.last_connected_date = new_addr.last_connected_date
+                    del new_addr
+                else:
+                    self.sess.add(new_addr)
+                    have_addr[key] = new_addr
+            # TODO if this message is for a new node, and if we have no associated
+            # channels for this node, we should ignore the message and return here,
+            # to mitigate DOS. but race condition: the channels we have for this
+            # node, might be under verification in self.ca_verifier, what then?
+        del nodes, addresses
+        if old_addr:
+            del old_addr
         self.sess.commit()
+        self.network.trigger_callback('ln_status')
 
     def get_routing_policy_for_channel(self, start_node_id: bytes,
                                        short_channel_id: bytes) -> Optional[bytes]:
