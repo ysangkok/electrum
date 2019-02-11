@@ -273,7 +273,7 @@ class SendScreen(CScreen):
         amount_sat = self.app.get_amount(self.screen.amount)
         addr = self.app.wallet.lnworker._check_invoice(invoice, amount_sat)
         try:
-            route = asyncio.run_coroutine_threadsafe(self.app.wallet.lnworker._create_route_from_invoice(decoded_invoice=addr), self.app.network.asyncio_loop)
+            route = self.app.wallet.lnworker._create_route_from_invoice(decoded_invoice=addr)
         except Exception as e:
             dia = LightningOpenChannelDialog(self.app, addr, str(e) + _(':\nYou can open a channel.'))
             dia.open()

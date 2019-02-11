@@ -436,7 +436,7 @@ class LNWorker(PrintError):
             else:
                 if not node_info:
                     raise ConnStringFormatError(_('Unknown node:') + ' ' + bh2u(node_id))
-                addrs = list(node_info.addresses)
+                addrs = node_info.get_addresses()
                 if len(addrs) == 0:
                     raise ConnStringFormatError(_('Don\'t know any addresses for node:') + ' ' + bh2u(node_id))
                 host, port = self.choose_preferred_address(addrs)
@@ -685,7 +685,7 @@ class LNWorker(PrintError):
         unconnected_nodes = self.channel_db.get_200_randomly_sorted_nodes_not_in(self.peers.keys())
         if unconnected_nodes:
             for node in unconnected_nodes:
-                addrs = list(node.addresses)
+                addrs = node.get_addresses()
                 if not addrs:
                     continue
                 host, port = self.choose_preferred_address(addrs)
@@ -751,7 +751,7 @@ class LNWorker(PrintError):
             # try random address for node_id
             node_info = await self.channel_db._nodes_get(chan.node_id)
             if not node_info: return
-            addresses = node_info.addresses
+            addresses = node_info.get_addresses()
             if not addresses: return
             adr_obj = random.choice(addresses)
             host, port = adr_obj.host, adr_obj.port

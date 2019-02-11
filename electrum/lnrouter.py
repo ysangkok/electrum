@@ -35,9 +35,8 @@ import binascii
 import base64
 import asyncio
 
-from sqlalchemy import create_engine, event, Column, ForeignKey, Integer, String, DateTime, Boolean
+from sqlalchemy import create_engine, Column, ForeignKey, Integer, String, DateTime, Boolean
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import relationship
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.orm.query import Query
 from sqlalchemy.ext.declarative import declarative_base
@@ -61,6 +60,9 @@ if TYPE_CHECKING:
 serializer = LNSerializer()
 
 class UnknownEvenFeatureBits(Exception): pass
+class NoChannelPolicy(Exception):
+    def __init__(self, short_channel_id: bytes):
+        super().__init__(f'cannot find channel policy for short_channel_id: {bh2u(short_channel_id)}')
 
 def validate_features(features : int):
     enabled_features = list_enabled_bits(features)
@@ -107,7 +109,7 @@ class ChannelInfoInDB(Base):
     def msg_payload(self):
         return bytes.fromhex(self.msg_payload_hex)
 
-    def on_channel_update(self, msg, trusted=False):
+    def on_channel_update(self, msg: dict, trusted=False):
         assert self.short_channel_id == msg['short_channel_id'].hex()
         flags = int.from_bytes(msg['channel_flags'], 'big')
         direction = flags & FLAG_DIRECTION
@@ -194,8 +196,7 @@ class NodeInfoInDB(Base):
     timestamp = Column(Integer, nullable=False)
     alias = Column(String(64), nullable=False)
 
-    @property
-    def addresses(self):
+    def get_addresses(self):
         return DBSession.query(AddressInDB).join(NodeInfoInDB).filter_by(node_id = self.node_id).all()
 
     @staticmethod
@@ -266,6 +267,9 @@ class ChannelDB:
         global engine
         self.network = network
 
+        self.num_nodes = 0
+        self.num_channels = 0
+
         self.path = os.path.join(get_headers_dir(network.config), 'channel_db.sqlite3')
         engine = create_engine('sqlite:///' + self.path)#, echo=True)
         DBSession.remove()
@@ -277,23 +281,13 @@ class ChannelDB:
         self.lock = threading.RLock()
 
         # (intentionally not persisted)
-        self._channel_updates_for_private_channels = {}  # type: Dict[Tuple[bytes, bytes], bytes]
+        self._channel_updates_for_private_channels = {}  # type: Dict[Tuple[bytes, bytes], dict]
 
         self.ca_verifier = LNChannelVerifier(network, self)
 
-    def num_channels(self, sig):
-        # NOTE: don't need result, result will come back over the signal!
-        asyncio.run_coroutine_threadsafe(self._num_channels(sig), self.network.asyncio_loop)
-
-    async def _num_channels(self, sig):
-        return sig.emit(DBSession.query(ChannelInfoInDB).count())
-
-    def num_nodes(self, sig):
-        # NOTE: don't need result, result will come back over the signal!
-        asyncio.run_coroutine_threadsafe(self._num_nodes(sig), self.network.asyncio_loop)
-
-    async def _num_nodes(self, sig):
-        return sig.emit(DBSession.query(NodeInfoInDB).count())
+    def update_counts(self):
+        self.num_channels = DBSession.query(ChannelInfoInDB).count()
+        self.num_nodes = DBSession.query(NodeInfoInDB).count()
 
     def add_recent_peer(self, peer : LNPeerAddr):
         addr = DBSession.query(AddressInDB).filter_by(node_id = peer.pubkey.hex()).one_or_none()
@@ -376,6 +370,7 @@ class ChannelDB:
             if not trusted: self.ca_verifier.add_new_channel_info(channel_info.short_channel_id, channel_info.msg_payload)
         DBSession.commit()
         self.network.trigger_callback('ln_status')
+        self.update_counts()
 
     @profiler
     def on_channel_update(self, msg_payloads, trusted=False):
@@ -424,6 +419,8 @@ class ChannelDB:
                 key = (new_addr.node_id, new_addr.host, new_addr.port)
                 old_addr = have_addr.get(key)
                 if old_addr:
+                    # since old_addr is embedded in have_addr,
+                    # it will still live when commmit is called
                     old_addr.last_connected_date = new_addr.last_connected_date
                     del new_addr
                 else:
@@ -438,6 +435,7 @@ class ChannelDB:
             del old_addr
         DBSession.commit()
         self.network.trigger_callback('ln_status')
+        self.update_counts()
 
     def get_routing_policy_for_channel(self, start_node_id: bytes,
                                        short_channel_id: bytes) -> Optional[bytes]:
@@ -683,7 +681,7 @@ class LNPathFinder(PrintError):
         for node_id, short_channel_id in path:
             channel_policy = self.channel_db.get_routing_policy_for_channel(prev_node_id, short_channel_id)
             if channel_policy is None:
-                raise Exception(f'cannot find channel policy for short_channel_id: {bh2u(short_channel_id)}')
+                raise NoChannelPolicy(short_channel_id)
             route.append(RouteEdge.from_channel_policy(channel_policy, short_channel_id, node_id))
             prev_node_id = node_id
         return route
